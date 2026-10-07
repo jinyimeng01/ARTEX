@@ -1,11 +1,14 @@
 package db
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Autumn-27/artex/notify"
 )
 
 func TestTaskLifecycleAndDeleteCascade(t *testing.T) {
@@ -704,5 +707,74 @@ func TestListTasksOrderByIDDesc(t *testing.T) {
 	// Newest (largest id) first.
 	if seen[0] != ids[2] || seen[1] != ids[1] || seen[2] != ids[0] {
 		t.Fatalf("order=%v, want descending %v", seen, []int64{ids[2], ids[1], ids[0]})
+	}
+}
+
+// TestDeleteTaskCascadeRemovesFindingNotificationEvents 与单条删除同源：notification_events.finding_id
+// 没有外键，删任务时如果不显式清理，投递历史里会留下挂在
+// 已删任务上的事件行。这里同时断言事件行与级联的投递行。
+func TestDeleteTaskCascadeRemovesFindingNotificationEvents(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+
+	tk, err := d.CreateTask("删任务清理通知事件", "目标", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	es := d.Exploration(tk.ExplorationID)
+	nodeID, err := es.AddNode(KindFinding, map[string]any{"summary": "x", "severity": "high"}, 5, "confirmed", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fid, err := d.AddFinding(tk.ID, nodeID, "XSS", "反射型 XSS", "high", "summary", "poc", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	chID, err := d.SaveNotificationChannel(context.Background(), &NotificationChannel{
+		Name:       "任务删除用例渠道-" + t.Name(),
+		Kind:       "webhook",
+		Mode:       "realtime",
+		Config:     []byte(`{"webhook":"https://example.com/hook"}`),
+		Filter:     []byte(`{}`),
+		RatePerMin: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM notification_channels WHERE id=$1`, chID)
+
+	evID, err := d.AddNotificationEvent(context.Background(), "finding_created", fid, notify.Snapshot{
+		Kind:      "finding_created",
+		FindingID: fid,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(`INSERT INTO notification_deliveries(event_id,channel_id,state) VALUES($1,$2,'sent')`, evID, chID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := d.DeleteTaskCascade(tk.ID, false, true); err != nil {
+		t.Fatal(err)
+	}
+
+	var evCnt int
+	if err := d.QueryRow(`SELECT count(*) FROM notification_events WHERE finding_id=$1`, fid).Scan(&evCnt); err != nil {
+		t.Fatal(err)
+	}
+	if evCnt != 0 {
+		t.Fatalf("任务已删除但通知事件仍然存在，残留 %d 行", evCnt)
+	}
+
+	var dlCnt int
+	if err := d.QueryRow(`SELECT count(*) FROM notification_deliveries WHERE event_id=$1`, evID).Scan(&dlCnt); err != nil {
+		t.Fatal(err)
+	}
+	if dlCnt != 0 {
+		t.Fatalf("任务已删除但投递行仍然存在，残留 %d 行", dlCnt)
 	}
 }

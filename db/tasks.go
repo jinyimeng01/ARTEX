@@ -629,6 +629,16 @@ DELETE FROM assets a USING deletable d WHERE a.id=d.id`, id, expID)
 		result.AssetsDetached, _ = res.RowsAffected()
 	}
 	if deleteFindings {
+		// notification_events.finding_id 是裸 BIGINT、没有外键，所以删掉
+		// findings 行不会带走它。任务删除后投递历史里会留下挂在
+		// 已删任务上的事件与投递行，且快照会被 joinedDeliveryQuery
+		// 继续推给前端。这里先按 finding_id 清掉，投递行由外键级联。
+		// 不补外键的理由与 DeleteFinding 一致：分派在事务外进行，
+		// 让删除可能因为一条正在分派的行失败。
+		if _, err := tx.Exec(`DELETE FROM notification_events WHERE finding_id IN (
+			SELECT id FROM findings WHERE task_id = $1)`, id); err != nil {
+			return result, err
+		}
 		res, err := tx.Exec(`DELETE FROM findings WHERE task_id = $1`, id)
 		if err != nil {
 			return result, err
