@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Autumn-27/artex/notify"
 )
 
 // TestDeleteFinding verifies删除漏洞 removes both the findings row and its
@@ -55,6 +58,79 @@ func TestDeleteFinding(t *testing.T) {
 	// deleting a non-existent finding is a no-op (0 rows), not an error
 	if n, err := d.DeleteFinding(fid); err != nil || n != 0 {
 		t.Fatalf("re-delete: want (0,nil), got (%d,%v)", n, err)
+	}
+}
+
+// TestDeleteFindingRemovesNotificationEvents 是 #166 的回归用例：notification_events.finding_id
+// 没有外键，所以删掉 findings 行后投递历史仍会留下已删漏洞的记录。
+// 这里同时断言事件行与级联删除的投递行都没了。
+func TestDeleteFindingRemovesNotificationEvents(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+
+	tk, err := d.CreateTask("删除漏洞清理通知事件", "目标", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteTask(tk.ID)
+
+	es := d.Exploration(tk.ExplorationID)
+	nodeID, err := es.AddNode(KindFinding, map[string]any{"summary": "x", "severity": "high"}, 5, "confirmed", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fid, err := d.AddFinding(tk.ID, nodeID, "XSS", "反射型 XSS", "high", "summary", "poc", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	chID, err := d.SaveNotificationChannel(context.Background(), &NotificationChannel{
+		Name:       "清理用例渠道-" + t.Name(),
+		Kind:       "webhook",
+		Mode:       "realtime",
+		Config:     json.RawMessage(`{"webhook":"https://example.com/hook"}`),
+		Filter:     json.RawMessage(`{}`),
+		RatePerMin: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM notification_channels WHERE id=$1`, chID)
+
+	evID, err := d.AddNotificationEvent(context.Background(), "finding_created", fid, notify.Snapshot{
+		Kind:      "finding_created",
+		FindingID: fid,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 给该事件落一条投递行：投递行是事件行的级联删除，
+	// 它也应该跟着消失——否则投递历史里会留着挂在已删漏洞上的记录。
+	if _, err := d.Exec(`INSERT INTO notification_deliveries(event_id,channel_id,state) VALUES($1,$2,'sent')`, evID, chID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := d.DeleteFinding(fid); err != nil {
+		t.Fatal(err)
+	}
+
+	var evCnt int
+	if err := d.QueryRow(`SELECT count(*) FROM notification_events WHERE finding_id=$1`, fid).Scan(&evCnt); err != nil {
+		t.Fatal(err)
+	}
+	if evCnt != 0 {
+		t.Fatalf("漏洞已删除但通知事件仍然存在，残留 %d 行", evCnt)
+	}
+
+	var dlCnt int
+	if err := d.QueryRow(`SELECT count(*) FROM notification_deliveries WHERE event_id=$1`, evID).Scan(&dlCnt); err != nil {
+		t.Fatal(err)
+	}
+	if dlCnt != 0 {
+		t.Fatalf("漏洞已删除但投递行仍然存在，残留 %d 行", dlCnt)
 	}
 }
 

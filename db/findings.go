@@ -650,11 +650,12 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 	return f, nil
 }
 
-// DeleteFinding removes a finding entirely: the standalone findings row and its
-// originating exploration node (kind='finding'), so it disappears from the findings
-// list, the per-task 发现 Tab, and the exploration graph alike. Deleting the node
-// cascades its edges + node_assets and nulls any activity referencing it. Returns
-// rows affected (0 = no finding with that id).
+// DeleteFinding removes a finding entirely: the standalone findings row, its
+// originating exploration node (kind='finding'), and the notification events raised
+// for it, so it disappears from the findings list, the per-task 发现 Tab, the
+// exploration graph, and the 投递历史 alike. Deleting the node cascades its edges +
+// node_assets and nulls any activity referencing it; deleting the events cascades
+// their deliveries. Returns rows affected (0 = no finding with that id).
 func (d *DB) DeleteFinding(id int64) (n int64, err error) {
 	err = d.WithEvidenceTx(context.Background(), func(tx *sql.Tx) error {
 		if err := LockFindingEvidenceTx(tx, id, nil); err != nil {
@@ -671,6 +672,15 @@ func (d *DB) DeleteFinding(id int64) (n int64, err error) {
 			if _, err := tx.Exec(`DELETE FROM exploration_nodes WHERE id=$1 AND kind='finding'`, nodeID.Int64); err != nil {
 				return err
 			}
+		}
+		// notification_events.finding_id 是裸 BIGINT、没有外键，所以删掉 findings
+		// 行不会带走它（寄存的投递历史会持续列出已删的漏洞，
+		// 并把它的快照再推给前端）。这里显式清理；
+		// 不去补外键，是因为这里的清理在同一个事务内、且先于
+		// dispatcher 的 fan-out；补一个 ON DELETE CASCADE 会让删除可能因为一条
+		// 正在分派的事件行而失败，把可恢复的删除变成不可删。
+		if _, err := tx.Exec(`DELETE FROM notification_events WHERE finding_id=$1`, id); err != nil {
+			return err
 		}
 		n = 1
 		return nil
