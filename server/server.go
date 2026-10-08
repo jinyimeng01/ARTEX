@@ -767,6 +767,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/exploration/findings/{id}/retests", s.startFindingRetest)
 	mux.HandleFunc("PATCH /api/exploration/findings/{id}", s.patchFinding)
 	mux.HandleFunc("DELETE /api/exploration/findings/{id}", s.deleteFinding)
+	mux.HandleFunc("PATCH /api/exploration/findings/batch", s.patchFindingsBatch)
+	mux.HandleFunc("DELETE /api/exploration/findings/batch", s.deleteFindingsBatch)
 	mux.HandleFunc("GET /api/exploration/intents", s.intents)
 	mux.HandleFunc("GET /api/exploration/graph", s.explorationGraph)
 	mux.HandleFunc("GET /api/exploration/nodes", s.explorationNodes)

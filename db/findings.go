@@ -678,6 +678,101 @@ func (d *DB) DeleteFinding(id int64) (n int64, err error) {
 	return
 }
 
+// MaxFindingBatchSize 限制一次批量操作的漏洞条数。
+//
+// 上限与 MaxTaskCategoryBatchSize 同量级：批量路径要对每条漏洞走一次
+// 「锁行→改状态→登记推送事件」，条数无上限时单个请求就能长时间持锁，
+// 把并发写入全堵住。200 条足够覆盖一屏列表的多选操作。
+const MaxFindingBatchSize = 200
+
+// BatchFindingStatusResult 是批量改状态后单个漏洞的结果。
+//
+// 逐条返回而不是整体报错：批量操作里既有不存在的漏洞、也有状态本就相同的，
+// 一条失败就整批回滚会让前端无法告诉用户「哪几条真的改了」。
+type BatchFindingStatusResult struct {
+	ID       int64  `json:"id"`
+	From     string `json:"from,omitempty"`
+	Changed  bool   `json:"changed"`
+	Found    bool   `json:"found"`
+	Notified bool   `json:"notified,omitempty"`
+}
+
+// SetFindingsStatusBatch 在**一个事务**里把多条漏洞改到同一状态，并逐条登记
+// 「状态变更」推送事件。
+//
+// 复用 SetFindingStatusTx 而不是循环调 SetFindingStatusWithNotify：后者每条
+// 自带一个事务，批量时会出现「前几条已提交、后几条失败」的中间态，推送事件
+// 也可能只落一半。放进同一个事务后，要么全成、要么全不成。
+//
+// 单条不存在只记 found=false，不中断整批——调用方据此逐条汇报。
+func (d *DB) SetFindingsStatusBatch(ctx context.Context, ids []int64, status string) ([]BatchFindingStatusResult, error) {
+	if len(ids) == 0 || len(ids) > MaxFindingBatchSize {
+		return nil, fmt.Errorf("finding ids 数量必须为 1-%d", MaxFindingBatchSize)
+	}
+	results := make([]BatchFindingStatusResult, 0, len(ids))
+	err := d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
+		for _, id := range ids {
+			from, found, changed, notified, err := SetFindingStatusTx(ctx, tx, id, status)
+			if err != nil {
+				return err
+			}
+			results = append(results, BatchFindingStatusResult{
+				ID: id, From: from, Changed: changed, Found: found, Notified: notified,
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+// DeleteFindingsBatch 在**一个事务**里删除多条漏洞，语义与 DeleteFinding 逐条
+// 调用一致：findings 行、来源 kind='finding' 探索节点、该漏洞的通知事件，
+// 以及由事件级联的投递行。
+//
+// 为什么不让调用方循环调 DeleteFinding：那样每条自带一个事务，批量中途失败
+// 会留下「删了一半」的状态，而用户是在页面上一次性勾选后点的删除。
+func (d *DB) DeleteFindingsBatch(ctx context.Context, ids []int64) ([]BatchFindingStatusResult, error) {
+	if len(ids) == 0 || len(ids) > MaxFindingBatchSize {
+		return nil, fmt.Errorf("finding ids 数量必须为 1-%d", MaxFindingBatchSize)
+	}
+	results := make([]BatchFindingStatusResult, 0, len(ids))
+	err := d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
+		for _, id := range ids {
+			found := true
+			if err := LockFindingEvidenceTx(tx, id, nil); err != nil {
+				if errors.Is(err, ErrFindingNotFound) {
+					found = false
+				} else {
+					return err
+				}
+			}
+			if found {
+				var nodeID sql.NullInt64
+				if err := tx.QueryRowContext(ctx, `DELETE FROM findings WHERE id=$1 RETURNING node_id`, id).Scan(&nodeID); err != nil {
+					return err
+				}
+				if nodeID.Valid {
+					if _, err := tx.ExecContext(ctx, `DELETE FROM exploration_nodes WHERE id=$1 AND kind='finding'`, nodeID.Int64); err != nil {
+						return err
+					}
+				}
+				if _, err := tx.ExecContext(ctx, `DELETE FROM notification_events WHERE finding_id=$1`, id); err != nil {
+					return err
+				}
+			}
+			results = append(results, BatchFindingStatusResult{ID: id, Found: found})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
 // DeleteFindingsByTask removes all findings rows of a task. The originating
 // exploration finding nodes are cascade-deleted separately when the task's
 // exploration subgraph is dropped. Returns rows deleted.
